@@ -1,6 +1,6 @@
 # Dataset Explorer
 
-Dataset Explorer is a small Streamlit app for viewing a CSV file. It reports the dataset size, column types, distinct non-missing values, missing values, and extra exact duplicate rows. It can also show the sum of a numeric column for each category in a bar chart and totals table. It does not change or clean the source data.
+Dataset Explorer is a small Streamlit app for inspecting and comparing CSV files. For one dataset, it reports the row and column counts, column types, distinct non-missing values, missing values, whitespace-only cells, and extra exact duplicate rows. It can show category sums in a bar chart, inspect numeric values with an IQR boxplot, and optionally show rows containing spaces only. It can also compare an older and a newer CSV by schema, missing cells, and record ID. It does not change or clean the source data.
 
 ## Verified environment
 
@@ -27,8 +27,12 @@ http://localhost:8501). To stop the app, press Ctrl+C in that terminal.
 3. Choose comma or semicolon to match the separator in your file.
 4. Review the summary, column details, and preview of up to the first 100 rows.
 5. Choose a category column and a numeric column to see category totals. The chart shows at most the top 20 categories; the table shows every category total.
+6. In **Inspect numeric values**, choose a numeric column to see its finite-value count, missing/excluded count, boxplot, IQR boundaries, and rows that need inspection. At least four finite values are needed for an IQR verdict. A flag asks you to inspect a value; it does not mean the value is wrong.
+7. In **Compare two CSV versions**, upload the older file as BEFORE and the newer file as AFTER. Review the row, column, and missing-cell totals, then expand the details. Record matching requires a shared ID that is nonblank and unique in both files.
 
 The file must use UTF-8 encoding. Empty fields and pandas' default missing-value markers (such as `NA`, `N/A`, `NULL`, and `NaN`) count as missing. Other text is kept as text. Counts and duplicate checks use the full uploaded file, not just the preview. Duplicate counts exclude the first occurrence of each exact row.
+
+The comparison section reads cell text as text so IDs such as `001` remain distinct from `1`. In that section, empty and whitespace-only cells count as missing, while `0` and literal strings such as `NA` and `null` remain values. Added and removed records are matched by exact ID text, never by row position or by the net row-count change. Comparison summaries use every row; detailed changes are in collapsed sections.
 
 For the category chart, missing category rows are counted separately and excluded from category totals. Missing numeric values are ignored by the sum; a category with no numeric values is labeled `No data` in the table, not treated as zero. The chart plots only categories with numeric totals, sorted from highest to lowest, and shows at most 20. The totals table includes every non-missing category.
 
@@ -43,5 +47,9 @@ reinstall them into it, run:
 
 ## Verification
 
-See `checks.txt` for the checks run, their actual results, and items that still
-need a manual browser check.
+The comparison was checked with the M3C4 sample pair: BEFORE has 6 rows and 3
+missing cells; AFTER has 7 rows and 1 missing cell. Matching by `row_id` finds
+G/H/I as added and E/F as removed. Same-file, swapped-file, reordered-row,
+duplicate-ID, and text-ID checks were also run.
+
+On Windows, `start_dataset_explorer.ps1` starts the app with the project `.venv` and opens its local page. A desktop shortcut can point to this script.

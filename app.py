@@ -1,10 +1,41 @@
+import io
 from pathlib import Path
 
+import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import streamlit as st
 
 
 MAX_UPLOAD_SIZE_MB = 5
+
+
+def is_comparison_missing(value):
+    """Treat empty and whitespace-only CSV cells as missing for comparison."""
+    return isinstance(value, str) and (value == "" or value.strip() == "")
+
+
+def read_comparison_csv(uploaded_file, separator):
+    """Read a separate text-preserving view without pandas' default NA conversion."""
+    return pd.read_csv(
+        io.BytesIO(uploaded_file.getvalue()),
+        sep=separator,
+        encoding="utf-8-sig",
+        dtype=str,
+        keep_default_na=False,
+        na_filter=False,
+        header=0,
+    )
+
+
+def comparison_missing_mask(frame):
+    return frame.apply(lambda column: column.map(is_comparison_missing))
+
+
+def comparison_value(value):
+    """Canonicalize blank cells only for matching row values; keep source text intact."""
+    return None if is_comparison_missing(value) else value
+
 
 st.set_page_config(page_title="Dataset Explorer", page_icon="📊", layout="wide")
 
@@ -79,6 +110,17 @@ if uploaded_file is not None:
         missing_percent = (missing_count / row_count * 100).round(2)
     else:
         missing_percent = pd.Series(0.0, index=data.columns)
+    whitespace_only_cells = data.apply(
+        lambda column: column.map(
+            lambda value: isinstance(value, str)
+            and len(value) > 0
+            and all(character == " " for character in value)
+        )
+    )
+    whitespace_only_count = whitespace_only_cells.sum(axis=0)
+    whitespace_only_row_mask = whitespace_only_cells.any(axis=1)
+    whitespace_only_rows = data.loc[whitespace_only_row_mask]
+    whitespace_only_total = int(whitespace_only_count.sum())
     duplicate_count = int(data.duplicated(keep="first").sum())
 
     st.subheader("2. Dataset summary")
@@ -91,6 +133,10 @@ if uploaded_file is not None:
         st.info("This file has a header row but no data rows.")
 
     st.subheader("3. Column details")
+    st.caption(
+        "Whitespace-only cells contain one or more regular space characters and no other characters. "
+        "Empty/NaN values, tabs, and 0 are not included. Values are counted as read and are not changed."
+    )
     column_details = pd.DataFrame(
         {
             "Column name": data.columns,
@@ -98,14 +144,27 @@ if uploaded_file is not None:
             "Distinct non-missing values": data.nunique(dropna=True).to_numpy(),
             "Missing values": missing_count.to_numpy(),
             "Missing (%)": missing_percent.to_numpy(),
+            "Whitespace-only cells": whitespace_only_count.to_numpy(),
         }
     )
     st.dataframe(column_details, hide_index=True, width="stretch")
+    st.metric("Total whitespace-only cells", f"{whitespace_only_total:,}")
 
     st.subheader("4. Data preview")
     preview_count = min(row_count, 100)
     st.caption(f"Showing the first {preview_count:,} of {row_count:,} rows.")
     st.dataframe(data.head(100), hide_index=True, width="stretch")
+
+    if st.checkbox(
+        "Show only rows with cells made only of spaces",
+        help="Shows every row containing at least one cell with one or more regular spaces only. "
+        "This view does not change the uploaded data, summary, or chart.",
+    ):
+        st.caption(
+            f"Showing {len(whitespace_only_rows):,} matching rows. "
+            "Summary counts and chart calculations still use the full uploaded table."
+        )
+        st.dataframe(whitespace_only_rows, hide_index=True, width="stretch")
 
     st.subheader("5. Category totals")
     numeric_columns = list(data.select_dtypes(include="number").columns)
@@ -201,3 +260,352 @@ if uploaded_file is not None:
                 f"Exact totals by `{category_column}` for every non-missing category value:"
             )
             st.dataframe(table_totals, hide_index=True, width="stretch")
+
+    st.subheader("6. Inspect numeric values")
+    numeric_inspection_columns = list(data.select_dtypes(include="number").columns)
+    if not numeric_inspection_columns:
+        st.info(
+            "This dataset has no numeric columns to inspect. Numeric inspection is unavailable."
+        )
+    else:
+        inspection_column = st.selectbox(
+            "Choose a numeric column to inspect",
+            options=numeric_inspection_columns,
+            key="numeric_inspection_column",
+        )
+        numeric_series = pd.to_numeric(data[inspection_column], errors="coerce")
+        numeric_array = numeric_series.to_numpy(dtype=float, na_value=np.nan)
+        finite_mask = np.isfinite(numeric_array)
+        values = numeric_array[finite_mask]
+        usable_count = int(finite_mask.sum())
+        excluded_count = row_count - usable_count
+        source_row_numbers = np.arange(1, row_count + 1)
+
+        usable_metric, excluded_metric = st.columns(2)
+        usable_metric.metric("Usable finite numbers", f"{usable_count:,}")
+        excluded_metric.metric("Missing or non-finite values", f"{excluded_count:,}")
+
+        if usable_count == 0:
+            st.info(
+                "This column has no usable finite numbers. Missing and infinite values "
+                "are excluded from the IQR calculation."
+            )
+        elif usable_count < 4:
+            st.info(
+                f"There are only {usable_count} usable finite values. At least 4 are needed "
+                "for this IQR inspection, so no IQR boundaries or verdict are shown."
+            )
+        else:
+            values_series = pd.Series(values)
+            q1 = float(values_series.quantile(0.25))
+            q3 = float(values_series.quantile(0.75))
+            iqr = q3 - q1
+            lower_boundary = q1 - 1.5 * iqr
+            upper_boundary = q3 + 1.5 * iqr
+            flagged_mask = finite_mask & (
+                (numeric_array < lower_boundary) | (numeric_array > upper_boundary)
+            )
+            flagged_count = int(flagged_mask.sum())
+
+            q1_metric, q3_metric, iqr_metric, flagged_metric = st.columns(4)
+            q1_metric.metric("Q1", f"{q1:g}")
+            q3_metric.metric("Q3", f"{q3:g}")
+            iqr_metric.metric("IQR", f"{iqr:g}")
+            flagged_metric.metric("Needs inspection", f"{flagged_count:,}")
+            st.caption(
+                f"IQR boundaries: {lower_boundary:g} to {upper_boundary:g}. "
+                "Only values strictly below or above these boundaries are flagged. "
+                "A flag means needs inspection; it does not prove a value is an error."
+            )
+
+            fig, ax = plt.subplots(figsize=(9, 2.8))
+            ax.boxplot(
+                values,
+                orientation="horizontal",
+                whis=1.5,
+                showfliers=True,
+                patch_artist=True,
+                boxprops={"facecolor": "#dce7fa", "edgecolor": "#0757ff"},
+                medianprops={"color": "#08112e", "linewidth": 2},
+                flierprops={
+                    "marker": "o",
+                    "markerfacecolor": "#e07826",
+                    "markeredgecolor": "#8b4310",
+                    "markersize": 7,
+                },
+            )
+            ax.axvline(
+                lower_boundary,
+                color="#0757ff",
+                linestyle="--",
+                label=f"Lower boundary: {lower_boundary:g}",
+            )
+            ax.axvline(
+                upper_boundary,
+                color="#a54416",
+                linestyle="--",
+                label=f"Upper boundary: {upper_boundary:g}",
+            )
+            ax.set_xlabel(inspection_column)
+            ax.set_yticks([])
+            ax.set_title(f"Boxplot for {inspection_column} — unusual points need inspection")
+            ax.grid(axis="x", alpha=0.2)
+            ax.legend(loc="best", fontsize=8)
+            fig.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+
+            if flagged_count == 0:
+                st.success("No values need inspection under the 1.5 × IQR rule.")
+            else:
+                flagged_rows = data.loc[flagged_mask].copy()
+                flagged_rows.insert(
+                    0,
+                    "Source row",
+                    source_row_numbers[flagged_mask],
+                )
+                st.markdown("**Rows marked “Needs inspection”**")
+                st.caption(
+                    "Source row is the 1-based row position in the uploaded CSV. "
+                    "Original columns, including any row ID, are shown unchanged."
+                )
+                st.dataframe(flagged_rows, hide_index=True, width="stretch")
+else:
+    st.subheader("6. Inspect numeric values")
+    st.info("Upload a CSV file first to inspect one of its numeric columns.")
+
+
+st.subheader("7. Compare two CSV versions")
+st.write(
+    "Compare an older file with a newer one. This section reads text for matching and "
+    "missing-cell counts; it does not change either uploaded file."
+)
+before_upload, after_upload = st.columns(2)
+with before_upload:
+    before_file = st.file_uploader(
+        "BEFORE — old file",
+        type=None,
+        accept_multiple_files=False,
+        max_upload_size=MAX_UPLOAD_SIZE_MB,
+        key="comparison_before_file",
+        help="CSV with a header row, UTF-8, up to 5 MB.",
+    )
+with after_upload:
+    after_file = st.file_uploader(
+        "AFTER — new file",
+        type=None,
+        accept_multiple_files=False,
+        max_upload_size=MAX_UPLOAD_SIZE_MB,
+        key="comparison_after_file",
+        help="CSV with a header row, UTF-8, up to 5 MB.",
+    )
+
+if before_file is not None:
+    st.caption(f"BEFORE filename: {before_file.name}")
+if after_file is not None:
+    st.caption(f"AFTER filename: {after_file.name}")
+
+if before_file is None or after_file is None:
+    st.info("Upload both a BEFORE file and an AFTER file to see the comparison.")
+else:
+    comparison_frames = {}
+    comparison_files = {"BEFORE": before_file, "AFTER": after_file}
+    for side, comparison_file in comparison_files.items():
+        if Path(comparison_file.name).suffix.lower() != ".csv":
+            st.error(f"{side}: wrong file type. Please choose a .csv file.")
+            continue
+        try:
+            comparison_frames[side] = read_comparison_csv(comparison_file, separator)
+        except pd.errors.EmptyDataError:
+            st.error(f"{side}: the file is empty or has no header row.")
+        except UnicodeDecodeError:
+            st.error(f"{side}: the file is not valid UTF-8.")
+        except pd.errors.ParserError:
+            st.error(f"{side}: the CSV could not be read with the selected separator.")
+        except Exception:
+            st.error(f"{side}: could not read the CSV. Check its header and selected separator.")
+
+    if len(comparison_frames) == 2:
+        before_data = comparison_frames["BEFORE"]
+        after_data = comparison_frames["AFTER"]
+        before_missing_mask = comparison_missing_mask(before_data)
+        after_missing_mask = comparison_missing_mask(after_data)
+        before_missing_total = int(before_missing_mask.to_numpy().sum())
+        after_missing_total = int(after_missing_mask.to_numpy().sum())
+
+        summary_rows, summary_columns, summary_missing = st.columns(3)
+        summary_rows.metric(
+            "Rows",
+            f"{len(before_data):,} → {len(after_data):,}",
+            delta=f"Δ {len(after_data) - len(before_data):+,}",
+            delta_color="off",
+        )
+        summary_columns.metric(
+            "Columns",
+            f"{len(before_data.columns):,} → {len(after_data.columns):,}",
+            delta=f"Δ {len(after_data.columns) - len(before_data.columns):+,}",
+            delta_color="off",
+        )
+        summary_missing.metric(
+            "Missing cells",
+            f"{before_missing_total:,} → {after_missing_total:,}",
+            delta=f"Δ {after_missing_total - before_missing_total:+,}",
+            delta_color="off",
+        )
+        st.caption(
+            "Deltas are AFTER − BEFORE. For this comparison, empty cells and cells "
+            "containing only whitespace are missing. Zero and literal text such as NA "
+            "or null are values. IDs and other cell text, including leading zeros, "
+            "are preserved as text."
+        )
+
+        before_columns = list(before_data.columns)
+        after_columns = list(after_data.columns)
+        before_column_set = set(before_columns)
+        after_column_set = set(after_columns)
+        added_columns = [column for column in after_columns if column not in before_column_set]
+        removed_columns = [column for column in before_columns if column not in after_column_set]
+        common_columns = [column for column in before_columns if column in after_column_set]
+
+        with st.expander("Column changes", expanded=False):
+            column_added, column_removed = st.columns(2)
+            with column_added:
+                st.markdown("**Added columns**")
+                if added_columns:
+                    st.success("Added — " + ", ".join(added_columns))
+                else:
+                    st.info("Added — no columns")
+            with column_removed:
+                st.markdown("**Removed columns**")
+                if removed_columns:
+                    st.error("Removed — " + ", ".join(removed_columns))
+                else:
+                    st.info("Removed — no columns")
+
+        with st.expander("Missing cells in common columns", expanded=False):
+            if common_columns:
+                before_common_missing = before_missing_mask[common_columns].sum()
+                after_common_missing = after_missing_mask[common_columns].sum()
+                missing_by_column = pd.DataFrame(
+                    {
+                        "Column": common_columns,
+                        "BEFORE missing": [int(before_common_missing[column]) for column in common_columns],
+                        "AFTER missing": [int(after_common_missing[column]) for column in common_columns],
+                    }
+                )
+                st.dataframe(missing_by_column, hide_index=True, width="stretch")
+            else:
+                st.info("There are no common columns to compare.")
+
+        with st.expander("Record changes by ID", expanded=False):
+            if not common_columns:
+                st.info("Record matching is unavailable because the files have no common columns.")
+            else:
+                selected_id = st.selectbox(
+                    "Choose a common ID column",
+                    options=common_columns,
+                    index=None,
+                    placeholder="Select a column...",
+                    key="comparison_id_column",
+                    help="An ID should identify the same record in both files.",
+                )
+                if selected_id is None:
+                    st.info("Record matching is unavailable until you select a common ID column.")
+                else:
+                    before_ids = before_data[selected_id]
+                    after_ids = after_data[selected_id]
+                    before_blank = before_ids.map(is_comparison_missing)
+                    after_blank = after_ids.map(is_comparison_missing)
+                    before_duplicate = (~before_blank) & before_ids.duplicated(keep=False)
+                    after_duplicate = (~after_blank) & after_ids.duplicated(keep=False)
+                    id_problems = []
+                    if before_blank.any():
+                        id_problems.append(
+                            f"BEFORE has {int(before_blank.sum()):,} blank ID value(s)."
+                        )
+                    if after_blank.any():
+                        id_problems.append(
+                            f"AFTER has {int(after_blank.sum()):,} blank ID value(s)."
+                        )
+                    if before_duplicate.any():
+                        id_problems.append(
+                            f"BEFORE has {int(before_duplicate.sum()):,} row(s) with duplicate IDs."
+                        )
+                    if after_duplicate.any():
+                        id_problems.append(
+                            f"AFTER has {int(after_duplicate.sum()):,} row(s) with duplicate IDs."
+                        )
+
+                    if id_problems:
+                        st.warning(
+                            "Record matching is unavailable because the selected ID must be "
+                            "nonblank and unique in both files. " + " ".join(id_problems)
+                        )
+                    else:
+                        before_id_values = before_ids.tolist()
+                        after_id_values = after_ids.tolist()
+                        before_id_set = set(before_id_values)
+                        after_id_set = set(after_id_values)
+                        added_ids = [value for value in after_id_values if value not in before_id_set]
+                        removed_ids = [value for value in before_id_values if value not in after_id_set]
+                        common_ids = [value for value in before_id_values if value in after_id_set]
+                        before_by_id = before_data.set_index(selected_id, drop=False)
+                        after_by_id = after_data.set_index(selected_id, drop=False)
+                        common_value_columns = [
+                            column for column in common_columns if column != selected_id
+                        ]
+                        changed_ids = []
+                        unchanged_ids = []
+                        for record_id in common_ids:
+                            changed = any(
+                                comparison_value(before_by_id.at[record_id, column])
+                                != comparison_value(after_by_id.at[record_id, column])
+                                for column in common_value_columns
+                            )
+                            (changed_ids if changed else unchanged_ids).append(record_id)
+
+                        st.caption(
+                            "ID values are matched exactly as text. Changed/Unchanged compare "
+                            "common non-ID columns; added or removed columns are listed separately."
+                        )
+                        added_label, removed_label = st.columns(2)
+                        with added_label:
+                            if added_ids:
+                                st.success(f"Added — {len(added_ids):,}: " + ", ".join(added_ids))
+                            else:
+                                st.info("Added — 0 records")
+                        with removed_label:
+                            if removed_ids:
+                                st.error(f"Removed — {len(removed_ids):,}: " + ", ".join(removed_ids))
+                            else:
+                                st.info("Removed — 0 records")
+
+                        if changed_ids:
+                            st.warning(
+                                f"Changed — {len(changed_ids):,}: " + ", ".join(changed_ids)
+                            )
+                        else:
+                            st.info("Changed — 0 records")
+                        st.markdown(
+                            f"Unchanged — {len(unchanged_ids):,}: "
+                            + (", ".join(unchanged_ids) if unchanged_ids else "none")
+                        )
+
+                        if added_ids:
+                            st.markdown("**Added original records (from AFTER)**")
+                            st.dataframe(
+                                after_data.loc[after_ids.isin(added_ids)],
+                                hide_index=True,
+                                width="stretch",
+                            )
+                        else:
+                            st.caption("No added records.")
+                        if removed_ids:
+                            st.markdown("**Removed original records (from BEFORE)**")
+                            st.dataframe(
+                                before_data.loc[before_ids.isin(removed_ids)],
+                                hide_index=True,
+                                width="stretch",
+                            )
+                        else:
+                            st.caption("No removed records.")
