@@ -1,4 +1,6 @@
 import io
+import json
+import math
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -35,6 +37,118 @@ def comparison_missing_mask(frame):
 def comparison_value(value):
     """Canonicalize blank cells only for matching row values; keep source text intact."""
     return None if is_comparison_missing(value) else value
+
+
+def read_experiment_json(uploaded_file):
+    if Path(uploaded_file.name).suffix.lower() != ".json":
+        raise ValueError("Choose a .json experiment summary file.")
+    try:
+        record = json.loads(uploaded_file.getvalue().decode("utf-8-sig"))
+    except UnicodeDecodeError as error:
+        raise ValueError("The file is not valid UTF-8 JSON.") from error
+    except json.JSONDecodeError as error:
+        raise ValueError(f"Invalid JSON near line {error.lineno}, column {error.colno}.") from error
+    if not isinstance(record, dict):
+        raise ValueError("The JSON root must be one experiment summary object.")
+    if "format_version" in record and record["format_version"] != 1:
+        raise ValueError("Unsupported experiment summary format. Expected format_version 1.")
+    return record
+
+
+def is_finite_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        return False
+    return math.isfinite(number)
+
+
+def is_finite_metric(value):
+    return is_finite_number(value) and 0 <= float(value) <= 1
+
+
+def is_known_context_value(field, value):
+    if field in {"format_version", "seed"}:
+        return isinstance(value, int) and not isinstance(value, bool)
+    if field == "features":
+        return isinstance(value, list) and all(isinstance(feature, str) for feature in value)
+    if field == "threshold":
+        return is_finite_number(value)
+    return isinstance(value, str) and bool(value.strip())
+
+
+def normalized_experiment_context(field, value):
+    return tuple(sorted(set(value))) if field == "features" else value
+
+
+def experiment_context_status(record_a, record_b):
+    context_fields = (
+        "format_version",
+        "dataset_id",
+        "split_id",
+        "target",
+        "positive_class",
+        "features",
+        "threshold",
+        "seed",
+        "evaluation_split",
+    )
+    missing = []
+    differences = []
+    for field in context_fields:
+        if field not in record_a or not is_known_context_value(field, record_a.get(field)):
+            missing.append(f"A: {field}")
+        if field not in record_b or not is_known_context_value(field, record_b.get(field)):
+            missing.append(f"B: {field}")
+        if field not in record_a or field not in record_b:
+            continue
+        if not is_known_context_value(field, record_a[field]) or not is_known_context_value(
+            field, record_b[field]
+        ):
+            continue
+        value_a = normalized_experiment_context(field, record_a[field])
+        value_b = normalized_experiment_context(field, record_b[field])
+        if value_a != value_b:
+            differences.append(f"{field}: A = {record_a[field]!r}; B = {record_b[field]!r}")
+        if field == "evaluation_split":
+            if record_a[field] != "validation":
+                differences.append(f"A evaluation_split is {record_a[field]!r}, not 'validation'")
+            if record_b[field] != "validation":
+                differences.append(f"B evaluation_split is {record_b[field]!r}, not 'validation'")
+
+    if missing:
+        return "Insufficient context", missing, differences
+    if differences:
+        return "Conditions differ", [], differences
+    return "Same recorded conditions", [], []
+
+
+def format_experiment_value(field, value):
+    if value is None:
+        return "Not recorded"
+    if field == "features" and isinstance(value, list):
+        return "[" + ", ".join(sorted(set(value))) + "]"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return str(value)
+
+
+def signed_metric_delta(value):
+    if value > 0:
+        return f"+{value:.2f}"
+    if value < 0:
+        return f"-{abs(value):.2f}"
+    return "+0.00"
+
+
+def signed_setting_delta(value):
+    if value > 0:
+        return f"+{value:g}"
+    if value < 0:
+        return f"−{abs(value):g}"
+    return "+0"
 
 
 st.set_page_config(page_title="Dataset Explorer", page_icon="📊", layout="wide")
@@ -609,3 +723,235 @@ else:
                             )
                         else:
                             st.caption("No removed records.")
+
+
+st.subheader("8. Compare experiment summaries")
+st.write(
+    "Compare two saved experiment summary JSON files. These records describe the "
+    "experiment; this view does not train or load a model."
+)
+experiment_upload_a, experiment_upload_b = st.columns(2)
+with experiment_upload_a:
+    experiment_file_a = st.file_uploader(
+        "Experiment A",
+        type=["json"],
+        accept_multiple_files=False,
+        max_upload_size=MAX_UPLOAD_SIZE_MB,
+        key="experiment_summary_a",
+    )
+with experiment_upload_b:
+    experiment_file_b = st.file_uploader(
+        "Experiment B",
+        type=["json"],
+        accept_multiple_files=False,
+        max_upload_size=MAX_UPLOAD_SIZE_MB,
+        key="experiment_summary_b",
+    )
+
+if experiment_file_a is not None:
+    st.caption(f"A filename: {experiment_file_a.name}")
+if experiment_file_b is not None:
+    st.caption(f"B filename: {experiment_file_b.name}")
+
+if experiment_file_a is None or experiment_file_b is None:
+    st.info("Upload one JSON summary as A and one as B to compare experiments.")
+else:
+    experiment_records = {}
+    experiment_files = {"A": experiment_file_a, "B": experiment_file_b}
+    for side, experiment_file in experiment_files.items():
+        try:
+            experiment_records[side] = read_experiment_json(experiment_file)
+        except ValueError as error:
+            st.error(f"{side} ({experiment_file.name}): {error}")
+
+    if len(experiment_records) == 2:
+        record_a = experiment_records["A"]
+        record_b = experiment_records["B"]
+        run_id_a = format_experiment_value("run_id", record_a.get("run_id"))
+        run_id_b = format_experiment_value("run_id", record_b.get("run_id"))
+        st.caption(f"A run ID: {run_id_a} · B run ID: {run_id_b}")
+
+        status, missing_context, context_differences = experiment_context_status(
+            record_a, record_b
+        )
+        metric_values = {"A": {}, "B": {}}
+        metric_states = {"A": {}, "B": {}}
+        invalid_metric_messages = []
+        missing_primary_metrics = []
+        metric_names = ("train_f1", "f1", "precision", "recall")
+
+        for side, record in experiment_records.items():
+            metric_record = record.get("metrics")
+            if not isinstance(metric_record, dict):
+                metric_record = {}
+                for metric_name in metric_names:
+                    metric_values[side][metric_name] = None
+                    metric_states[side][metric_name] = "missing"
+                    if metric_name in {"f1", "precision", "recall"}:
+                        missing_primary_metrics.append(f"{side}.metrics.{metric_name}")
+            else:
+                for metric_name in metric_names:
+                    if metric_name not in metric_record:
+                        metric_values[side][metric_name] = None
+                        metric_states[side][metric_name] = "missing"
+                        if metric_name in {"f1", "precision", "recall"}:
+                            missing_primary_metrics.append(f"{side}.metrics.{metric_name}")
+                    elif not is_finite_metric(metric_record[metric_name]):
+                        metric_values[side][metric_name] = None
+                        metric_states[side][metric_name] = "invalid"
+                        invalid_metric_messages.append(
+                            f"{side}.metrics.{metric_name} must be a finite number in [0, 1]."
+                        )
+                    else:
+                        metric_values[side][metric_name] = float(metric_record[metric_name])
+                        metric_states[side][metric_name] = "valid"
+
+        if missing_primary_metrics:
+            status = "Insufficient context"
+            missing_context.extend(
+                f"Missing metric: {field}" for field in missing_primary_metrics
+            )
+
+        st.markdown(f"**Comparison status: {status}**")
+        if status == "Same recorded conditions":
+            st.caption(
+                "Required recorded conditions match. This does not verify the underlying "
+                "data rows, the measurements, or their quality. Model, penalty, and C are "
+                "settings to inspect; their differences alone do not change this status."
+            )
+        elif status == "Conditions differ":
+            st.info("Recorded conditions do not match the required validation comparison.")
+        else:
+            st.info("Some required context is missing or not recorded; no defaults were assumed.")
+        for field in missing_context:
+            st.caption(f"Missing or unknown: {field}")
+        for difference in context_differences:
+            st.caption(f"Condition difference: {difference}")
+
+        if invalid_metric_messages:
+            st.error(
+                "Invalid metric values were found. Calculations using those values are withheld: "
+                + " ".join(invalid_metric_messages)
+            )
+
+        metric_cards = st.columns(3)
+        for card, metric_name, label in zip(
+            metric_cards,
+            ("f1", "precision", "recall"),
+            ("F1", "Precision", "Recall"),
+        ):
+            state_a = metric_states["A"][metric_name]
+            state_b = metric_states["B"][metric_name]
+            value_a = metric_values["A"][metric_name]
+            value_b = metric_values["B"][metric_name]
+            shown_a = f"{value_a:.2f}" if state_a == "valid" else state_a.title()
+            shown_b = f"{value_b:.2f}" if state_b == "valid" else state_b.title()
+            metric_delta = None
+            if state_a == "valid" and state_b == "valid":
+                metric_delta = signed_metric_delta(value_b - value_a)
+            card.metric(
+                label,
+                f"{shown_a} → {shown_b}",
+                delta=metric_delta,
+                delta_color="normal",
+            )
+        st.caption(
+            "Metric deltas are B − A. Green, red, and neutral directions describe the "
+            "numeric change only; they do not select a winner or establish better quality."
+        )
+
+        setting_fields = (
+            ("run_id", "Run ID"),
+            ("dataset_id", "Dataset ID"),
+            ("split_id", "Split ID"),
+            ("target", "Target"),
+            ("positive_class", "Positive class"),
+            ("features", "Features"),
+            ("evaluation_split", "Evaluation split"),
+            ("threshold", "Threshold"),
+            ("seed", "Seed"),
+            ("model", "Model"),
+            ("penalty", "Penalty"),
+            ("C", "C"),
+        )
+
+        with st.expander("Recorded settings and differences", expanded=False):
+            setting_rows = []
+            for field, label in setting_fields:
+                value_a = record_a.get(field)
+                value_b = record_b.get(field)
+                shown_a = format_experiment_value(field, value_a)
+                shown_b = format_experiment_value(field, value_b)
+                known_a = field in record_a and value_a is not None
+                known_b = field in record_b and value_b is not None
+                if not known_a or not known_b:
+                    difference = "Not recorded"
+                elif normalized_experiment_context(field, value_a) == normalized_experiment_context(
+                    field, value_b
+                ):
+                    difference = "Same"
+                elif (
+                    field == "C"
+                    and is_finite_number(value_a)
+                    and is_finite_number(value_b)
+                ):
+                    difference = "Δ " + signed_setting_delta(value_b - value_a)
+                else:
+                    difference = "Different"
+                setting_rows.append(
+                    {"Setting": label, "A": shown_a, "B": shown_b, "Difference": difference}
+                )
+            st.dataframe(pd.DataFrame(setting_rows), hide_index=True, width="stretch")
+            notes = []
+            if record_a.get("note"):
+                notes.append(f"A note: {record_a['note']}")
+            if record_b.get("note"):
+                notes.append(f"B note: {record_b['note']}")
+            if notes:
+                for note in notes:
+                    st.caption(str(note))
+
+        def validation_gap(record, side):
+            if record.get("evaluation_split") != "validation":
+                split = format_experiment_value("evaluation_split", record.get("evaluation_split"))
+                return f"Unavailable: evaluation_split is {split}"
+            train_state = metric_states[side]["train_f1"]
+            f1_state = metric_states[side]["f1"]
+            if train_state == "valid" and f1_state == "valid":
+                return f"{metric_values[side]['train_f1'] - metric_values[side]['f1']:.2f}"
+            if train_state == "invalid" or f1_state == "invalid":
+                return "Unavailable: invalid metric"
+            return "Unavailable: metric not recorded"
+
+        with st.expander("Train − validation F1 details", expanded=False):
+            gap_rows = []
+            for side, record in (("A", record_a), ("B", record_b)):
+                gap_rows.append(
+                    {
+                        "Run": side,
+                        "Evaluation split": format_experiment_value(
+                            "evaluation_split", record.get("evaluation_split")
+                        ),
+                        "Train F1": (
+                            f"{metric_values[side]['train_f1']:.2f}"
+                            if metric_states[side]["train_f1"] == "valid"
+                            else metric_states[side]["train_f1"].title()
+                        ),
+                        "F1 on recorded split": (
+                            f"{metric_values[side]['f1']:.2f}"
+                            if metric_states[side]["f1"] == "valid"
+                            else metric_states[side]["f1"].title()
+                        ),
+                        "Train − validation F1": validation_gap(record, side),
+                    }
+                )
+            st.dataframe(pd.DataFrame(gap_rows), hide_index=True, width="stretch")
+            st.caption(
+                "The gap is calculated only when that run records evaluation_split as validation. "
+                "No train-to-validation gap is inferred for other or missing splits."
+            )
+
+        st.caption(
+            "Run IDs and split IDs are recorded labels, not audited hashes. Matching labels "
+            "cannot prove that the underlying rows or measurements are identical."
+        )
